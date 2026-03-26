@@ -3,12 +3,14 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import sounddevice as sd
 import numpy as np
-from scipy.io.wavfile import write
+from scipy.io.wavfile import write, read
 import csv
 import os
 import json
 import time
 from datetime import datetime
+from threading import Thread
+import queue
 
 # --- CONFIGURATION ---
 SAMPLE_RATE = 16000  # Whisper standard
@@ -30,6 +32,14 @@ class ASRRecorder:
         self.is_recording = False
         self.audio_data = []
         self.saved_files = []
+
+        self.selected_device = None
+        self.stream = None
+
+        self.combo_device = None
+
+        # Audio level queue for visualization
+        self.level_queue = queue.Queue()
         
         # Ensure output dir exists
         if not os.path.exists(OUTPUT_DIR):
@@ -40,6 +50,8 @@ class ASRRecorder:
         
         # UI Setup
         self.setup_ui()
+
+        self.populate_devices()
         
         # Bind keys
         self.root.bind('<space>', self.toggle_record)
@@ -55,6 +67,44 @@ class ASRRecorder:
             self.btn_next.state(['disabled'])
         else:
             self.update_display()
+
+    def get_audio_devices(self):
+        devices = sd.query_devices()
+        default_idx = sd.query_devices(kind='input')['name']
+        input_devices = []
+        
+        for i, device in enumerate(devices):
+            if device['max_input_channels'] > 0:
+                name = device['name']
+                if name == default_idx:
+                    input_devices.insert(0, (i, f"{name} (default)"))
+                else: input_devices.append((i, name))
+
+        return input_devices
+
+    def populate_devices(self):
+        """Populate device dropdown with available audio devices."""
+        devices = self.get_audio_devices()
+        
+        if not devices:
+            messagebox.showerror("Error", "No audio input devices found!")
+            self.root.quit()
+            return
+        
+        device_names = [f"{name}" for _, name in devices]
+        self.selected_device = device_names[0]
+        self.combo_device['values'] = device_names
+        self.device_map = {name: device_id for device_id, name in devices}
+        
+        # Set default device
+        self.selected_device = devices[0][0]
+
+        self.combo_device.set(device_names[0])
+
+    def on_device_change(self, event=None):
+        """Handle device selection change."""
+        selected_name = self.combo_device.get()
+        self.selected_device = self.device_map[selected_name]
 
     def load_phrases(self):
         """Load prompts and remove those that already have audio files."""
@@ -105,7 +155,23 @@ class ASRRecorder:
         #     self.root.after(500, lambda: messagebox.showinfo("Resume Detected", msg))
 
     def setup_ui(self):
-        # Top Frame: Progress
+        
+        # ===== TOP FRAME: Device Selection =====
+        device_frame = ttk.LabelFrame(self.root, padding="10")
+        device_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(device_frame, text="Select Input Device:").pack(side=tk.LEFT, padx=5)
+
+        self.selected_device = tk.StringVar()
+        self.combo_device = ttk.Combobox(device_frame, textvariable=self.selected_device, 
+                                 state='readonly', width=50)
+        self.combo_device.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        self.combo_device.bind('<<ComboboxSelected>>', self.on_device_change)
+
+        self.lbl_device_info = ttk.Label(device_frame, text="", font=("Arial", 9))
+        self.lbl_device_info.pack(side=tk.LEFT, padx=10)
+
+        # Second Frame: Progress
         top_frame = ttk.Frame(self.root, padding="10")
         top_frame.pack(fill=tk.X)
         
@@ -170,7 +236,7 @@ class ASRRecorder:
         self.btn_record.config(text="Stop (Space)")
         
         try:
-            self.stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='int16',
+            self.stream = sd.InputStream(device=self.selected_device, samplerate=SAMPLE_RATE, channels=1, dtype='float32',
                                          callback=self.audio_callback)
             self.stream.start()
             self.start_time = time.time()
@@ -179,15 +245,12 @@ class ASRRecorder:
             self.is_recording = False
             self.lbl_status.config(text="Error starting audio", foreground="red")
 
-    def audio_callback(self, indata, frames, time, status):
-        """Callback to collect audio chunks."""
+    def audio_callback(self, indata, frames, time_info, status):
+        """Callback to collect audio chunks and compute levels."""
         if status:
             print(status)
-        self.audio_data.append(indata.copy())
         
-        # Safety cutoff
-        if time.currentTime - self.start_time > DURATION_LIMIT:
-            self.root.after(0, self.stop_recording)
+        self.audio_data.append(indata.copy())
 
     def stop_recording(self):
         if not self.is_recording:
@@ -196,6 +259,7 @@ class ASRRecorder:
         self.is_recording = False
         self.stream.stop()
         self.stream.close()
+        self.stream=None
         
         duration = time.time() - self.start_time
         self.lbl_status.config(text=f"Recorded {duration:.2f}s. Press Enter to Save or Space to Retry.", foreground="blue")
@@ -208,12 +272,14 @@ class ASRRecorder:
             return None
             
         recording = np.concatenate(self.audio_data, axis=0)
+        recording_int16 = (recording * 32767).astype(np.int16)
+        
         current_phrase = self.phrases_to_record[self.current_index]
         filename = f"{current_phrase['id']}.wav"
         filepath = os.path.join(OUTPUT_DIR, filename)
         
         # Save WAV
-        write(filepath, SAMPLE_RATE, recording)
+        write(filepath, SAMPLE_RATE, recording_int16)
         
         return {
             "audio_filepath": os.path.abspath(filepath),
@@ -268,7 +334,7 @@ class ASRRecorder:
             if os.path.exists(filepath):
                 # Calculate duration for existing file
                 try:
-                    rate, data = write(filepath)
+                    rate, data = read(filepath)
                     duration = float(len(data) / rate)
                 except:
                     duration = 0.0
@@ -291,6 +357,9 @@ class ASRRecorder:
         self.root.quit()
 
     def on_close(self, event=None):
+        if self.is_recording:
+            self.stop_recording()   
+
         if messagebox.askokcancel("Quit", "Stop recording? Progress is saved automatically on disk.\nYou can resume later."):
             self.root.quit()
 
