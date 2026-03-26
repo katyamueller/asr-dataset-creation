@@ -12,6 +12,12 @@ from datetime import datetime
 from threading import Thread
 import queue
 
+import matplotlib
+matplotlib.use('TkAgg')  # Ensure it uses the Tk backend
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
 # --- CONFIGURATION ---
 SAMPLE_RATE = 16000  # Whisper standard
 DURATION_LIMIT = 15  # Max seconds per recording (safety cutoff)
@@ -41,14 +47,22 @@ class ASRRecorder:
         # Audio level queue for visualization
         self.level_queue = queue.Queue()
         
-        # Ensure output dir exists
+        # Visualization variables
+        self.visualizer_active = False
+        self.num_bars = 10  # Number of bars for visualization
+        self.bars = []
+
+        self.bar_levels = np.zeros(self.num_bars)
+
+        self.fig = None
+        self.canvas = None
+        self.ax = None
+        
         if not os.path.exists(OUTPUT_DIR):
             os.makedirs(OUTPUT_DIR)
-            
-        # Load phrases
+
         self.load_phrases()
         
-        # UI Setup
         self.setup_ui()
 
         self.populate_devices()
@@ -181,7 +195,7 @@ class ASRRecorder:
         self.btn_save_manifest = ttk.Button(top_frame, text="Save Data & Exit", command=self.save_manifest_and_exit)
         self.btn_save_manifest.pack(side=tk.RIGHT)
 
-        # Middle Frame: Prompt Display
+        # Middle Frame: Phrase Display
         mid_frame = ttk.Frame(self.root, padding="20")
         mid_frame.pack(fill=tk.BOTH, expand=True)
         
@@ -190,6 +204,38 @@ class ASRRecorder:
         
         self.lbl_status = ttk.Label(mid_frame, text="Press SPACE to Record", foreground="gray", font=("Arial", 12))
         self.lbl_status.pack(pady=10)
+
+        # === Visualizer Frame ===
+        vis_frame = ttk.Frame(mid_frame, padding="5")
+        vis_frame.pack(pady=10)
+        
+        self.lbl_vis_status = ttk.Label(vis_frame, text="Microphone: Off", foreground="gray", font=("Arial", 9))
+        self.lbl_vis_status.pack(pady=5)
+
+        tk_bg = self.root.cget("bg")  # Tk-compatible color string
+        rgb = self.root.winfo_rgb(tk_bg)
+        mpl_bg = tuple(v / 65535 for v in rgb) # matplotlib compatible color tuple
+
+        self.fig = Figure(figsize=(5, 2), dpi=100)
+        self.fig.patch.set_facecolor(mpl_bg)
+
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_facecolor(mpl_bg)
+        self.ax.axis('off')
+        self.ax.set_xlim(0, self.num_bars)
+        self.ax.set_ylim(0, 1.0)
+        
+        # Create 10 bars for spectogram-ish audio visualization
+        self.bars = []
+        for i in range(self.num_bars):
+            bar = self.ax.bar(i, 0, width=0.6, color='#808080', align='center')
+            self.bars.append(bar[0])
+        
+        self.canvas = FigureCanvasTkAgg(self.fig, master=vis_frame)
+
+        widget = self.canvas.get_tk_widget()
+        widget.configure(bg=tk_bg, highlightthickness=0)
+        widget.pack()
 
         # Bottom Frame: Controls
         bot_frame = ttk.Frame(self.root, padding="10")
@@ -232,6 +278,7 @@ class ASRRecorder:
     def start_recording(self):
         self.is_recording = True
         self.audio_data = []
+        self.start_visualizer()
         self.lbl_status.config(text="🔴 RECORDING... (Press Space to Stop)", foreground="red")
         self.btn_record.config(text="Stop (Space)")
         
@@ -251,6 +298,76 @@ class ASRRecorder:
             print(status)
         
         self.audio_data.append(indata.copy())
+        
+        if indata.size > 0:
+            rms = np.sqrt(np.mean(indata**2))
+            
+            # Scaling logic (adjust threshold as needed)
+            max_threshold = 0.05 
+            if rms < 0.001:
+                rms = 0.0
+            else:
+                rms = min(rms / max_threshold, 1.0)
+            
+            # Add a tiny bit of random noise to each bar for "live" feel
+            # This prevents them from all moving in perfect lockstep
+            self.level_queue.put(rms)
+
+    def update_visualizer(self):
+        """Update the 10 bars based on audio level."""
+        if not self.visualizer_active:
+            return
+
+        while not self.level_queue.empty():
+            try:
+                base_level = self.level_queue.get_nowait()
+                
+                # Animate bars according to audio levels, add time delay and sin for smoother animation, middle bars higher
+                decay = 0.9  # to make it less jumpy, closer to 1 = slower fall
+
+                for i, bar in enumerate(self.bars):
+                    self.bar_levels[i] *= decay
+                    variation = 0.8 + 0.2 * np.sin(time.time() * 3 + i)
+
+                    center = self.num_bars / 2
+                    distance = abs(i - center) / center
+                    shape = 1 - distance  # center = 1, edges = 0
+
+                    target = base_level * variation * shape
+
+                    target = min(target, 1.0)
+
+                    # Smooth transition (EMA)
+                    alpha = 0.2  # smaller = smoother, larger = more reactive
+                    self.bar_levels[i] = (1 - alpha) * self.bar_levels[i] + alpha * target
+
+                    bar.set_height(self.bar_levels[i])
+                
+            except:
+                break
+        
+        # Redraw the canvas
+        self.canvas.draw_idle()
+        
+        # Schedule next update
+        if self.visualizer_active:
+            self.root.after(40, self.update_visualizer)
+
+    def start_visualizer(self):
+        self.visualizer_active = True
+        self.lbl_vis_status.config(text="Microphone: Active", foreground="green")
+        # Reset bars to 0 just in case
+        for bar in self.bars:
+            bar.set_height(0)
+        self.canvas.draw_idle()
+        self.update_visualizer()
+
+    def stop_visualizer(self):
+        self.visualizer_active = False
+        self.lbl_vis_status.config(text="Microphone: Off", foreground="gray")
+        for bar in self.bars:
+            bar.set_height(0)
+        self.canvas.draw_idle()
 
     def stop_recording(self):
         if not self.is_recording:
@@ -260,6 +377,8 @@ class ASRRecorder:
         self.stream.stop()
         self.stream.close()
         self.stream=None
+
+        self.stop_visualizer()
         
         duration = time.time() - self.start_time
         self.lbl_status.config(text=f"Recorded {duration:.2f}s. Press Enter to Save or Space to Retry.", foreground="blue")
@@ -314,6 +433,14 @@ class ASRRecorder:
 
     def save_manifest_and_exit(self):
         # merge newly recorded files with any existing ones in the folder
+
+        entry = self.save_current_audio()
+        if entry:
+            self.saved_files.append(entry)
+            self.current_index += 1
+            self.audio_data = []
+            self.btn_next.state(['disabled'])
+            self.btn_retry.state(['disabled'])
         
         all_entries = []
         
