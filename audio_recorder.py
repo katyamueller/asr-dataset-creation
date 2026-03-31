@@ -25,7 +25,7 @@ TARGET_SAMPLE_RATE = 16000
 TRIM_START_MS = 200 
 OUTPUT_DIR = "recordings"
 MANIFEST_FILE = "dataset_manifest.jsonl"
-PHRASES_FILE = "phrases.csv"
+PHRASES_FILE = "phrases.ssv"
 CONFIG_FILE = "recorder_config.json"
 MIN_DURATION_S = 0.5
 MAX_DURATION_S = 30.0
@@ -188,15 +188,7 @@ class ASRRecorder:
 
         temp_phrases = []
         with open(PHRASES_FILE, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f)
-            # for i, row in enumerate(reader):
-            #     if not row: continue
-            #     # Handle both "just text" and "id,text" formats
-            #     if len(row) == 1:
-            #         temp_phrases.append({"id": f"seg_{i:05d}", "text": row[0]})
-            #     else:
-            #         temp_phrases.append({"id": row[0], "text": row[1]})
-
+            reader = csv.reader(f, delimiter=';')
             for i, row in enumerate(reader):
                 if not row:
                     continue
