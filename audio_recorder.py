@@ -1,9 +1,11 @@
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 import sounddevice as sd
 import numpy as np
 from scipy.io.wavfile import write, read
+from scipy.signal import resample_poly
+from math import gcd
 import csv
 import os
 import json
@@ -19,17 +21,64 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 # --- CONFIGURATION ---
-SAMPLE_RATE = 16000  # Whisper standard
-DURATION_LIMIT = 15  # Max seconds per recording (safety cutoff)
+TARGET_SAMPLE_RATE = 16000 
+TRIM_START_MS = 200 
 OUTPUT_DIR = "recordings"
 MANIFEST_FILE = "dataset_manifest.jsonl"
 PHRASES_FILE = "phrases.csv"
+CONFIG_FILE = "recorder_config.json"
+MIN_DURATION_S = 0.5
+MAX_DURATION_S = 30.0
+MIN_RMS_THRESHOLD = 0.001
+CLIP_FRACTION_THRESHOLD = 0.01  # 1%
+CLIP_WARNING_COUNT = 10
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_config(config: dict):
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2)
+
+def _downsample(audio: np.ndarray, orig_rate: int, target_rate: int) -> np.ndarray:
+    if orig_rate == target_rate:
+        return audio
+    g = gcd(orig_rate, target_rate)
+    return resample_poly(audio, target_rate // g, orig_rate // g)
+
+def ask_speaker_name(root) -> str:
+    while True:
+        name = simpledialog.askstring(
+            "Speaker Name",
+            "Enter your first name:",
+            parent=root
+        )
+        if name is None:
+            root.destroy()
+            raise SystemExit("No speaker name provided. Exiting.")
+        name = name.strip().replace(" ", "_")
+        safe_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        if name and all(c in safe_chars for c in name):
+            return name
+        messagebox.showwarning("Invalid Name",
+            "Please use only letters or digits.", parent=root)
 
 class ASRRecorder:
     def __init__(self, root):
         self.root = root
         self.root.title("ASR Data Collection Tool")
+        config = load_config()
+        if "speaker_name" in config:
+            self.speaker_name = config["speaker_name"]
+        else:
+            self.speaker_name = ask_speaker_name(self.root)
+            config["speaker_name"] = self.speaker_name
+            save_config(config)
         self.root.geometry("800x600")
+        self.clipped_recording_count = 0
         
         # State variables
         self.all_phrases = []
@@ -120,6 +169,9 @@ class ASRRecorder:
         selected_name = self.combo_device.get()
         self.selected_device = self.device_map[selected_name]
 
+    def make_filename(self, phrase_id: str) -> str:
+        return f"{self.speaker_name}_{phrase_id}.wav"
+
     def load_phrases(self):
         """Load prompts and remove those that already have audio files."""
         if not os.path.exists(PHRASES_FILE):
@@ -137,13 +189,28 @@ class ASRRecorder:
         temp_phrases = []
         with open(PHRASES_FILE, 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
+            # for i, row in enumerate(reader):
+            #     if not row: continue
+            #     # Handle both "just text" and "id,text" formats
+            #     if len(row) == 1:
+            #         temp_phrases.append({"id": f"seg_{i:05d}", "text": row[0]})
+            #     else:
+            #         temp_phrases.append({"id": row[0], "text": row[1]})
+
             for i, row in enumerate(reader):
-                if not row: continue
-                # Handle both "just text" and "id,text" formats
+                if not row:
+                    continue
                 if len(row) == 1:
-                    temp_phrases.append({"id": f"seg_{i:05d}", "text": row[0]})
+                    col = row[0].strip()
+                    if i == 0 and col.lower() in ('text', 'phrase', 'sentence'):
+                        continue  # skip header
+                    temp_phrases.append({"id": f"seg_{i:05d}", "text": col})
                 else:
-                    temp_phrases.append({"id": row[0], "text": row[1]})
+                    id_col, text_col = row[0].strip(), row[1].strip()
+                    if i == 0 and id_col.lower() == 'id':
+                        continue  # skip header
+                    if id_col and text_col:
+                        temp_phrases.append({"id": id_col, "text": text_col})
         
         # Check existing files in output directory
         existing_files = set(os.listdir(OUTPUT_DIR))
@@ -153,7 +220,7 @@ class ASRRecorder:
         skipped_count = 0
         
         for item in temp_phrases:
-            filename = f"{item['id']}.wav"
+            filename = self.make_filename(item['id'])
             if filename in existing_files:
                 skipped_count += 1
             else:
@@ -163,10 +230,6 @@ class ASRRecorder:
         
         msg = f"Loaded {len(temp_phrases)} total phrases.\nFound {skipped_count} existing recordings.\n{len(self.phrases_to_record)} segments remaining."
         print(msg)
-
-        ## Show a small info box on startup if many were skipped
-        # if skipped_count > 0:
-        #     self.root.after(500, lambda: messagebox.showinfo("Resume Detected", msg))
 
     def setup_ui(self):
         
@@ -181,6 +244,15 @@ class ASRRecorder:
                                  state='readonly', width=50)
         self.combo_device.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         self.combo_device.bind('<<ComboboxSelected>>', self.on_device_change)
+
+        ttk.Label(
+            device_frame,
+            text=f"👤  {self.speaker_name}",
+            font=("Arial", 10, "bold"),
+            foreground="#2255aa",
+            relief="solid",
+            padding=(6, 2),
+        ).pack(side=tk.RIGHT, padx=8)
 
         self.lbl_device_info = ttk.Label(device_frame, text="", font=("Arial", 9))
         self.lbl_device_info.pack(side=tk.LEFT, padx=10)
@@ -240,6 +312,10 @@ class ASRRecorder:
         # Bottom Frame: Controls
         bot_frame = ttk.Frame(self.root, padding="10")
         bot_frame.pack(fill=tk.X)
+
+        self.btn_listen = ttk.Button(bot_frame, text="Listen Back", command=self.listen_back)
+        self.btn_listen.pack(side=tk.LEFT, padx=5)
+        self.btn_listen.state(['disabled'])
         
         self.btn_record = ttk.Button(bot_frame, text="Record (Space)", command=self.toggle_record)
         self.btn_record.pack(side=tk.LEFT, padx=5)
@@ -269,6 +345,32 @@ class ASRRecorder:
             self.btn_record.state(['disabled'])
             self.btn_next.state(['disabled'])
 
+    def listen_back(self):
+        if not self.audio_data:
+            return
+
+        recording = np.concatenate(self.audio_data, axis=0)
+        
+        # Apply the same processing pipeline as save_current_audio
+        trim_samples = int((TRIM_START_MS / 1000) * self.actual_sample_rate)
+        recording = recording[trim_samples:]
+        recording = _downsample(recording, self.actual_sample_rate, TARGET_SAMPLE_RATE)
+        recording = np.clip(recording, -1.0, 1.0)
+
+        self.lbl_status.config(text="▶️ Playing back...", foreground="gray")
+        self.btn_listen.state(['disabled'])
+        self.root.update()
+
+        def _play():
+            sd.play(recording, samplerate=TARGET_SAMPLE_RATE)
+            sd.wait()
+            self.root.after(0, lambda: self.btn_listen.state(['!disabled']))
+            self.root.after(0, lambda: self.lbl_status.config(
+                text="Listen back, then press Enter to Save or Space to Retry.",
+                foreground="blue"))
+
+        Thread(target=_play, daemon=True).start()
+
     def toggle_record(self, event=None):
         if self.is_recording:
             self.stop_recording()
@@ -283,10 +385,12 @@ class ASRRecorder:
         self.btn_record.config(text="Stop (Space)")
         
         try:
-            self.stream = sd.InputStream(device=self.selected_device, samplerate=SAMPLE_RATE, channels=1, dtype='float32',
+            self.stream = sd.InputStream(device=self.selected_device, channels=1, dtype='float32',
                                          callback=self.audio_callback)
             self.stream.start()
             self.start_time = time.time()
+            self.actual_sample_rate = int(self.stream.samplerate)
+
         except Exception as e:
             messagebox.showerror("Audio Error", f"Could not start recording:\n{e}")
             self.is_recording = False
@@ -372,39 +476,99 @@ class ASRRecorder:
     def stop_recording(self):
         if not self.is_recording:
             return
-            
+
         self.is_recording = False
         self.stream.stop()
         self.stream.close()
-        self.stream=None
-
+        self.stream = None
         self.stop_visualizer()
-        
+
         duration = time.time() - self.start_time
-        self.lbl_status.config(text=f"Recorded {duration:.2f}s. Press Enter to Save or Space to Retry.", foreground="blue")
+
+        if duration < MIN_DURATION_S:
+            self.audio_data = []
+            self.lbl_status.config(text=f"⚠️ Too short ({duration:.2f}s). Please re-record.", foreground="orange")
+            self.btn_record.config(text="Record (Space)")
+            return
+
+        if duration > MAX_DURATION_S:
+            self.audio_data = []
+            self.lbl_status.config(text=f"⚠️ Too long ({duration:.2f}s, max {MAX_DURATION_S}s). Please re-record.", foreground="orange")
+            self.btn_record.config(text="Record (Space)")
+            return
+
+        self.lbl_status.config(
+            text=f"Recorded {duration:.2f}s. Listen back, then press Enter to Save or Space to Retry.",
+            foreground="white",
+        )
         self.btn_record.config(text="Record (Space)")
         self.btn_next.state(['!disabled'])
         self.btn_retry.state(['!disabled'])
+        self.btn_listen.state(['!disabled'])  # enable listen button
 
     def save_current_audio(self):
         if not self.audio_data:
             return None
-            
+
         recording = np.concatenate(self.audio_data, axis=0)
-        recording_int16 = (recording * 32767).astype(np.int16)
-        
+
+        # RMS check
+        rms = np.sqrt(np.mean(recording**2))
+        if rms < MIN_RMS_THRESHOLD:
+            messagebox.showwarning("Silent Recording",
+                "The recording appears to be silent or very quiet.\n"
+                "Check your microphone and try again.")
+            self.audio_data = []
+            self.btn_next.state(['disabled'])
+            self.btn_listen.state(['disabled'])
+            return None
+
+        # Clip check
+        clipped_samples = np.sum(np.abs(recording) >= 1.0)
+        clip_fraction = clipped_samples / len(recording)
+        if clip_fraction > CLIP_FRACTION_THRESHOLD:
+            self.clipped_recording_count += 1
+            print(f"[WARN] Clipping detected: {clip_fraction:.1%} of samples clipped "
+                f"(recording #{self.clipped_recording_count})")
+            if self.clipped_recording_count >= CLIP_WARNING_COUNT:
+                messagebox.showwarning("Persistent Clipping Detected",
+                    f"{self.clipped_recording_count} recordings have had significant clipping.\n"
+                    "Please check the quality of your recordings and/ or reach out to us.")
+                self.clipped_recording_count = 0  # reset so it doesn't fire every recording
+
+        # space bar click was audible in recordings, so added delay 
+        trim_samples = int((TRIM_START_MS / 1000) * self.actual_sample_rate)
+        recording = recording[trim_samples:]
+
+        # downsample to 16kHz (sample rate used by ASR models)
+        recording = _downsample(recording, self.actual_sample_rate, TARGET_SAMPLE_RATE)
+        recording = np.clip(recording, -1.0, 1.0)
+
+        # Normalize to use the full dynamic range
+        max_val = np.abs(recording).max()
+        if max_val > 0:
+            recording = recording / max_val * 0.95 
+
+        # convert to 16bit int
+        recording_int16 = (recording * 32767).astype(np.int16) 
+
         current_phrase = self.phrases_to_record[self.current_index]
-        filename = f"{current_phrase['id']}.wav"
+        filename = self.make_filename(current_phrase['id'])
         filepath = os.path.join(OUTPUT_DIR, filename)
-        
-        # Save WAV
-        write(filepath, SAMPLE_RATE, recording_int16)
-        
+
+        # save as tmp first in case of curruption while saving 
+        tmp_path = filepath + ".tmp"
+        write(tmp_path, TARGET_SAMPLE_RATE, recording_int16)
+        os.rename(tmp_path, filepath)
+
         return {
             "audio_filepath": os.path.abspath(filepath),
             "text": current_phrase['text'],
             "id": current_phrase['id'],
-            "duration": len(recording) / SAMPLE_RATE
+            "speaker": self.speaker_name,
+            "duration": len(recording) / TARGET_SAMPLE_RATE,
+            "sample_rate": TARGET_SAMPLE_RATE,
+            "timestamp": datetime.now().isoformat(),
         }
 
     def next_item(self, event=None):
@@ -455,7 +619,7 @@ class ASRRecorder:
             if item['id'] in existing_ids_in_session:
                 continue # Already added from current session
             
-            filename = f"{item['id']}.wav"
+            filename = self.make_filename(item['id'])
             filepath = os.path.join(OUTPUT_DIR, filename)
             
             if os.path.exists(filepath):
