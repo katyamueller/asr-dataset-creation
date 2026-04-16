@@ -83,8 +83,11 @@ class ASRRecorder:
         
         self.encouragements = [
             "Keep it up!", "You're on a roll!", "Sounding great!",
-            "Nice one!", "Crushing it!", "Another one down!",
-            "You're flying!", "Almost there!", "Legend!"
+            "Nice one!", "Crushing it!", "Another one down!", "Rock on!",
+            "You're flying!", "Almost there!", "Legend!", "Mega!", 
+            "Klingt super!", "Weiter so!", "Superkalifragilistikexpialigetisch!",
+            "Naturtalent!", "Fantastisch!", "Wundervoll!", "Du machst das super!", 
+            "Maschine!", "Unglaublich!"
         ]
 
         # State variables
