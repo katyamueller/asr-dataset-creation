@@ -13,6 +13,7 @@ import time
 from datetime import datetime
 from threading import Thread
 import queue
+import random
 
 import matplotlib
 matplotlib.use('TkAgg')  # Ensure it uses the Tk backend
@@ -25,7 +26,7 @@ TARGET_SAMPLE_RATE = 16000
 TRIM_START_MS = 200 
 OUTPUT_DIR = "recordings"
 MANIFEST_FILE = "dataset_manifest.jsonl"
-PHRASES_FILE = "phrases.ssv"
+PHRASES_FILE = "package_Katya_size_854.ssv" #package_Katya_size_854
 CONFIG_FILE = "recorder_config.json"
 MIN_DURATION_S = 0.5
 MAX_DURATION_S = 30.0
@@ -80,6 +81,12 @@ class ASRRecorder:
         self.root.geometry("800x600")
         self.clipped_recording_count = 0
         
+        self.encouragements = [
+            "Keep it up!", "You're on a roll!", "Sounding great!",
+            "Nice one!", "Crushing it!", "Another one down!",
+            "You're flying!", "Almost there!", "Legend!"
+        ]
+
         # State variables
         self.all_phrases = []
         self.phrases_to_record = []
@@ -87,6 +94,7 @@ class ASRRecorder:
         self.is_recording = False
         self.audio_data = []
         self.saved_files = []
+        self._playback_active = False
 
         self.selected_device = None
         self.stream = None
@@ -117,6 +125,7 @@ class ASRRecorder:
         self.populate_devices()
         
         # Bind keys
+        self.root.bind('<l>', lambda e: self.listen_back())
         self.root.bind('<space>', self.toggle_record)
         self.root.bind('<Return>', self.next_item)
         self.root.bind('<r>', lambda e: self.retry_last())
@@ -256,8 +265,13 @@ class ASRRecorder:
         self.lbl_progress = ttk.Label(top_frame, text="Progress: 0 / 0", font=("Arial", 12, "bold"))
         self.lbl_progress.pack(side=tk.LEFT)
         
+        # Progress bar
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(top_frame, variable=self.progress_var, maximum=100, length=300)
+        self.progress_bar.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+        
         self.btn_save_manifest = ttk.Button(top_frame, text="Save Data & Exit", command=self.save_manifest_and_exit)
-        self.btn_save_manifest.pack(side=tk.RIGHT)
+        self.btn_save_manifest.pack(side=tk.RIGHT, padx=5)
 
         # Middle Frame: Phrase Display
         mid_frame = ttk.Frame(self.root, padding="20")
@@ -305,7 +319,7 @@ class ASRRecorder:
         bot_frame = ttk.Frame(self.root, padding="10")
         bot_frame.pack(fill=tk.X)
 
-        self.btn_listen = ttk.Button(bot_frame, text="Listen Back", command=self.listen_back)
+        self.btn_listen = ttk.Button(bot_frame, text="Listen Back (L)", command=self.listen_back)
         self.btn_listen.pack(side=tk.LEFT, padx=5)
         self.btn_listen.state(['disabled'])
         
@@ -329,18 +343,25 @@ class ASRRecorder:
 
             self.lbl_phrases.config(text=f"[{data['id']}]\n{data['text']}")
             self.lbl_progress.config(text=f"Remaining: {remaining} | Total Done: {total_original - remaining}")
+            
+            # Update progress bar
+            progress_percent = ((total_original - remaining) / total_original) * 100
+            self.progress_var.set(progress_percent)
+            
             self.lbl_status.config(text="Press SPACE to Record", foreground="gray")
+        
         
         else:
             self.lbl_phrases.config(text="🎉 All recordings complete!")
             self.lbl_status.config(text="Please save data and exit.")
+            self.progress_var.set(100)
             self.btn_record.state(['disabled'])
             self.btn_next.state(['disabled'])
 
     def listen_back(self):
-        if not self.audio_data:
+        if self.is_recording or not self.audio_data:
             return
-
+        self._playback_active = True
         recording = np.concatenate(self.audio_data, axis=0)
         
         # Apply the same processing pipeline as save_current_audio
@@ -356,20 +377,33 @@ class ASRRecorder:
         def _play():
             sd.play(recording, samplerate=TARGET_SAMPLE_RATE)
             sd.wait()
-            self.root.after(0, lambda: self.btn_listen.state(['!disabled']))
-            self.root.after(0, lambda: self.lbl_status.config(
-                text="Listen back, then press Enter to Save or Space to Retry.",
-                foreground="blue"))
+            if self._playback_active: 
+                self.root.after(0, lambda: self.btn_listen.state(['!disabled']))
+                self.root.after(0, lambda: self.btn_record.state(['!disabled']))  # Re-enable record
+                self.root.after(0, lambda: self.lbl_status.config(
+                    text="Listen back, then press Enter to Save or Space to Retry.",
+                    foreground="blue"))
+            self._playback_active = False
 
         Thread(target=_play, daemon=True).start()
 
     def toggle_record(self, event=None):
+        if self._playback_active:
+            return
         if self.is_recording:
             self.stop_recording()
         else:
             self.start_recording()
-
+    
     def start_recording(self):
+        if self._playback_active:
+            self._playback_active = False
+            sd.stop()
+            self.root.after(100, self._begin_recording)  # let stop settle
+        else:
+            self._begin_recording()
+
+    def _begin_recording(self):
         self.is_recording = True
         self.audio_data = []
         self.start_visualizer()
@@ -563,9 +597,29 @@ class ASRRecorder:
             "timestamp": datetime.now().isoformat(),
         }
 
+    def flash_encouragement(self, message, steps=15, interval=10):
+        self.lbl_status.config(text=message, foreground="green", font=("Arial", 14, "bold"))
+        
+        def fade(step):
+            ratio = step / steps
+            r = int(0 + 128 * ratio)
+            g = int(180 - 52 * ratio)
+            b = int(0 + 128 * ratio)
+            color = f"#{r:02x}{g:02x}{b:02x}"
+            self.lbl_status.config(foreground=color)
+            if step < steps:
+                self.root.after(interval, lambda: fade(step + 1))
+            else:
+                self.lbl_status.config(font=("Arial", 12))  # restore original
+                self.update_display()
+        
+        self.root.after(500, lambda: fade(0))
+
     def next_item(self, event=None):
+        if self._playback_active:
+            self._playback_active = False
+            sd.stop()
         if not self.is_recording and self.audio_data:
-            # Save and move next
             entry = self.save_current_audio()
             if entry:
                 self.saved_files.append(entry)
@@ -573,14 +627,28 @@ class ASRRecorder:
                 self.audio_data = []
                 self.btn_next.state(['disabled'])
                 self.btn_retry.state(['disabled'])
-                self.lbl_status.config(text="Press SPACE to Record", foreground="gray")
-                self.update_display()
+                self.btn_listen.state(['disabled'])
+                self.flash_encouragement(random.choice(self.encouragements))
+                # Smooth transition to next item with a slight delay
+                self.root.after(600, self._transition_to_next_item)
         elif self.current_index < len(self.phrases_to_record) and not self.audio_data:
-            # Just skip (no recording made)
             self.current_index += 1
-            self.update_display()
+            self._transition_to_next_item()
+    
+    def _transition_to_next_item(self):
+        """Smooth transition to the next item with visual feedback."""
+        # Brief "loading" state for smooth visual transition
+        self.root.update()
+        self.root.after(150, lambda: self.update_display())
+        # Re-enable buttons after transition
+        self.root.after(250, lambda: self.btn_next.state(['!disabled']))
+        self.root.after(250, lambda: self.btn_retry.state(['!disabled']))
+        self.root.after(250, lambda: self.btn_listen.state(['!disabled']))
 
     def retry_last(self, event=None):
+        if self._playback_active:
+            self._playback_active = False
+            sd.stop()
         if not self.is_recording and self.audio_data:
             self.audio_data = []
             self.lbl_status.config(text="Retrying... Press SPACE to Record", foreground="gray")
@@ -636,7 +704,13 @@ class ASRRecorder:
             for entry in all_entries:
                 f.write(json.dumps(entry) + '\n')
                 
-        messagebox.showinfo("Success", f"Manifest saved to {MANIFEST_FILE}\nTotal segments: {len(all_entries)}")
+        # messagebox.showinfo("Success", f"Manifest saved to {MANIFEST_FILE}\nTotal segments: {len(all_entries)}")
+        messagebox.showinfo(
+            "🎉 All Done!",
+            f"Great work, {self.speaker_name}!\n\n\n"
+            f"✅  {len(all_entries)} segments saved\n\n"
+            f"📁  {MANIFEST_FILE}",
+        )
         self.root.quit()
 
     def on_close(self, event=None):
